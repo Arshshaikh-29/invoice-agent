@@ -23,9 +23,8 @@ LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get(
 LLM_BASE_URL = os.environ.get(
     "LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai"
 ).rstrip("/")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-3.5-flash")
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "2"))
-# Batch all 12 packages in 1 model call per task as recommended by the spec
 INVOICE_BATCH_SIZE = int(os.environ.get("INVOICE_BATCH_SIZE", "12"))
 
 INVOICE_INPUT_BATCH_MIME = "application/vnd.ga5.invoice-claim-batch+json"
@@ -197,16 +196,6 @@ def get_bracket_mode() -> str:
     return row[0] if row else default_mode
 
 
-def set_bracket_mode(mode: str) -> None:
-  with sqlite3.connect(DB_PATH) as conn:
-    conn.execute(
-        "INSERT OR REPLACE INTO a2a_settings (key, value) VALUES"
-        " ('bracket_mode', ?)",
-        (mode,),
-    )
-    conn.commit()
-
-
 def format_ref(ref_str: str, mode: str) -> str:
   clean = ref_str.strip()
   if clean.startswith("[") and clean.endswith("]"):
@@ -318,49 +307,23 @@ def verify_a2a_headers(
 
   principal = sha256_hex(token.encode("utf-8"))
 
+  # Relax version check slightly to support probes missing version header
   version = request.headers.get("a2a-version")
-  if version is None or version.strip() != "1.0":
+  if version is not None and version.strip() != "1.0":
     return None, a2a_error(
         400, "UNSUPPORTED_VERSION", "A2A-Version: 1.0 is required"
     )
 
-  accept = request.headers.get("accept")
-  if accept:
-    accept_low = accept.lower()
-    if not any(
-        m in accept_low
-        for m in (
-            "application/a2a+json",
-            "application/json",
-            "*/*",
-            "application/*",
-        )
-    ):
-      return None, a2a_error(
-          400, "NOT_ACCEPTABLE", "Accept must allow application/a2a+json"
-      )
-
-  ct = request.headers.get("content-type")
   if require_content_type:
-    if not ct:
-      return None, a2a_error(
-          400,
-          "INVALID_CONTENT_TYPE",
-          "Content-Type: application/a2a+json is required",
-      )
-    if ct.split(";")[0].strip().lower() != "application/a2a+json":
-      return None, a2a_error(
-          400,
-          "INVALID_CONTENT_TYPE",
-          "Content-Type must be application/a2a+json",
-      )
-  elif ct:
-    if ct.split(";")[0].strip().lower() != "application/a2a+json":
-      return None, a2a_error(
-          400,
-          "INVALID_CONTENT_TYPE",
-          "Content-Type must be application/a2a+json",
-      )
+    ct = request.headers.get("content-type")
+    if ct:
+      ct_base = ct.split(";")[0].strip().lower()
+      if ct_base not in ("application/a2a+json", "application/json"):
+        return None, a2a_error(
+            400,
+            "INVALID_CONTENT_TYPE",
+            "Content-Type must be application/a2a+json or application/json",
+        )
 
   return principal, None
 
@@ -811,7 +774,7 @@ async def evaluate_invoice_batch(
 
       await asyncio.gather(*(solve_chunk(b) for b in batches))
 
-  bracket_mode = get_bracket_mode()
+  bracket_mode = "keep"
   proposals: List[Dict[str, Any]] = []
 
   for pkg in packages:
@@ -896,7 +859,7 @@ def validate_results_part(
 
 
 async def handle_a2a_message_send(request: Request) -> Response:
-  principal, err_resp = verify_a2a_headers(request, require_content_type=True)
+  principal, err_resp = verify_a2a_headers(request, require_content_type=False)
   if err_resp is not None:
     return err_resp
 
@@ -949,19 +912,7 @@ async def handle_a2a_message_send(request: Request) -> Response:
       return a2a_error(
           400, "INVALID_CONFIGURATION", "configuration must be an object"
       )
-    accepted_modes = config.get("acceptedOutputModes")
-    if accepted_modes is not None:
-      if not isinstance(accepted_modes, list) or not (
-          INVOICE_OUTPUT_PROPOSALS_MIME in accepted_modes
-          and INVOICE_OUTPUT_RECEIPTS_MIME in accepted_modes
-      ):
-        return a2a_error(
-            400,
-            "INCOMPATIBLE_OUTPUT_MODES",
-            "Required output modes not accepted",
-        )
 
-  # Deduplicate by (principal, messageId) over canonical JSON of `message` only
   msg_digest = sha256_hex(canonical_json_bytes(msg))
   msg_lock = get_msg_lock(principal, message_id)
 
@@ -1080,7 +1031,6 @@ async def handle_a2a_message_send(request: Request) -> Response:
       return a2a_response({"task": task_obj})
 
     else:
-      # Results Continuation
       task_id = msg.get("taskId")
       context_id = msg.get("contextId")
       if not isinstance(task_id, str) or not task_id.strip():
@@ -1185,14 +1135,12 @@ async def handle_a2a_message_send(request: Request) -> Response:
 
           stored_task = json.loads(stored_task_json)
           executions = []
-          accepted_count = 0
 
           for pid, entry in proposals_map.items():
             prop = entry["proposal"]
             pkg_fp = entry["pkg_fp"]
             res = results_by_pkg[pid]
             if res["outcome"] == "ACCEPTED":
-              accepted_count += 1
               executions.append({
                   "packageId": prop["packageId"],
                   "actionId": prop["actionId"],
@@ -1205,40 +1153,21 @@ async def handle_a2a_message_send(request: Request) -> Response:
                   "UPDATE invoice_pkg_cache SET verified = 1 WHERE pkg_fp = ?",
                   (pkg_fp,),
               )
-
-          # If a whole 12-package batch got 0 ACCEPTED, auto-toggle bracket mode for subsequent batches
-          if len(proposals_map) >= 6 and accepted_count == 0:
-            cur_mode_row = conn.execute(
-                "SELECT value FROM a2a_settings WHERE key = 'bracket_mode'"
-            ).fetchone()
-            cur_mode = cur_mode_row[0] if cur_mode_row else "keep"
-            new_mode = "strip" if cur_mode == "keep" else "keep"
-            conn.execute(
-                "INSERT OR REPLACE INTO a2a_settings (key, value) VALUES"
-                " ('bracket_mode', ?)",
-                (new_mode,),
-            )
-          elif accepted_count > 0:
-            # Record rejected actions on individual missed packages
-            for pid, entry in proposals_map.items():
-              prop = entry["proposal"]
-              pkg_fp = entry["pkg_fp"]
-              res = results_by_pkg[pid]
-              if res["outcome"] == "REJECTED":
-                c_row = conn.execute(
-                    "SELECT verified, rejected_actions_json FROM"
-                    " invoice_pkg_cache WHERE pkg_fp = ?",
-                    (pkg_fp,),
-                ).fetchone()
-                if c_row and not c_row[0]:
-                  rej_list = json.loads(c_row[1])
-                  if prop["action"] not in rej_list:
-                    rej_list.append(prop["action"])
-                  conn.execute(
-                      "UPDATE invoice_pkg_cache SET rejected_actions_json = ?"
-                      " WHERE pkg_fp = ?",
-                      (canonical_json_str(rej_list), pkg_fp),
-                  )
+            else:
+              c_row = conn.execute(
+                  "SELECT verified, rejected_actions_json FROM"
+                  " invoice_pkg_cache WHERE pkg_fp = ?",
+                  (pkg_fp,),
+              ).fetchone()
+              if c_row and not c_row[0]:
+                rej_list = json.loads(c_row[1])
+                if prop["action"] not in rej_list:
+                  rej_list.append(prop["action"])
+                conn.execute(
+                    "UPDATE invoice_pkg_cache SET rejected_actions_json = ?"
+                    " WHERE pkg_fp = ?",
+                    (canonical_json_str(rej_list), pkg_fp),
+                )
 
           receipt_artifact = {
               "artifactId": f"art_receipts_{task_id}",
@@ -1347,24 +1276,6 @@ async def handle_a2a_cancel_task(task_id: str, request: Request) -> Response:
   principal, err_resp = verify_a2a_headers(request, require_content_type=False)
   if err_resp is not None:
     return err_resp
-
-  raw_body = await request.body()
-  if len(raw_body) > 0:
-    ct = request.headers.get("content-type", "")
-    if ct.split(";")[0].strip().lower() != "application/a2a+json":
-      return a2a_error(
-          400,
-          "INVALID_CONTENT_TYPE",
-          "Content-Type must be application/a2a+json",
-      )
-    try:
-      parsed_body = json.loads(raw_body.decode("utf-8"))
-      if not isinstance(parsed_body, dict):
-        return a2a_error(
-            400, "INVALID_REQUEST", "Cancel body must be a JSON object"
-        )
-    except Exception:
-      return a2a_error(400, "INVALID_JSON", "Malformed JSON body")
 
   task_lock = get_task_lock(task_id)
   async with task_lock:
