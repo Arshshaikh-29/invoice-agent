@@ -1,5 +1,4 @@
 import asyncio
-import base64
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -9,16 +8,14 @@ import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import FastAPI, Request, Response
 import httpx
 
 # =====================================================================
-# Global Configuration
+# Configuration & Constants
 # =====================================================================
 
-DB_PATH = os.environ.get("AGENT_DB_PATH", "agent_state_v4.db")
+DB_PATH = os.environ.get("INVOICE_DB_PATH", "invoice_a2a_state.db")
 
 LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get(
     "OPENAI_API_KEY", ""
@@ -28,9 +25,9 @@ LLM_BASE_URL = os.environ.get(
 ).rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "2"))
-INVOICE_BATCH_SIZE = int(os.environ.get("INVOICE_BATCH_SIZE", "6"))
+# Batch all 12 packages in 1 model call per task as recommended by the spec
+INVOICE_BATCH_SIZE = int(os.environ.get("INVOICE_BATCH_SIZE", "12"))
 
-# Invoice A2A Constants
 INVOICE_INPUT_BATCH_MIME = "application/vnd.ga5.invoice-claim-batch+json"
 INVOICE_INPUT_RESULTS_MIME = "application/vnd.ga5.invoice-action-results+json"
 INVOICE_OUTPUT_PROPOSALS_MIME = (
@@ -40,7 +37,7 @@ INVOICE_OUTPUT_RECEIPTS_MIME = (
     "application/vnd.ga5.invoice-action-receipts+json"
 )
 
-INVOICE_ALLOWED_ACTIONS = [
+ALLOWED_ACTIONS = [
     "settle_invoice",
     "request_approval",
     "hold_invoice",
@@ -48,28 +45,10 @@ INVOICE_ALLOWED_ACTIONS = [
     "open_exception",
 ]
 
-# Mailroom Constants (Kept active so Question 3 remains working)
-MAILROOM_PROFILE_ID = "ga5-mailroom-action-gate/v2"
-MAILROOM_ALLOWED_ACTIONS = [
-    "create_draft",
-    "update_internal_record",
-    "send_approved_notice",
-    "request_confirmation",
-    "quarantine_item",
-    "no_action",
-]
-CALL_ID_REGEX = re.compile(r"^[A-Za-z0-9._:-]{12,128}$")
-HEX64_REGEX = re.compile(r"^[0-9a-f]{64}$")
-CANARY_REGEX = re.compile(
-    r"(?:canary|vault[_ -]?secret|secret[_ -]?canary|cnry[-_]|flag\{|do not"
-    r" disclose|confidential vault)",
-    re.IGNORECASE,
-)
-BRACKET_REF_REGEX = re.compile(r"\[([A-Za-z0-9_.:/#-]{2,80})\]")
+BRACKET_REF_REGEX = re.compile(r"\[([^\[\]\n]{2,80})\]")
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
-# In-process locks for concurrent request deduplication and cancel-vs-receipt race
 _msg_locks: Dict[str, asyncio.Lock] = {}
 _task_locks: Dict[str, asyncio.Lock] = {}
 
@@ -88,8 +67,7 @@ def get_task_lock(task_id: str) -> asyncio.Lock:
 
 
 @app.middleware("http")
-async def normalize_double_slashes(request: Request, call_next):
-  """Collapse accidental double slashes in URL path without redirecting."""
+async def collapse_double_slashes(request: Request, call_next):
   path = request.scope.get("path", "/")
   if "//" in path:
     request.scope["path"] = re.sub(r"/+", "/", path)
@@ -97,7 +75,7 @@ async def normalize_double_slashes(request: Request, call_next):
 
 
 # =====================================================================
-# Shared Utilities & Canonical Hashing
+# Canonical JSON, Hashing & Response Helpers
 # =====================================================================
 
 
@@ -129,9 +107,8 @@ def json_response(
     media_type: str = "application/json",
     extra_headers: Optional[Dict[str, str]] = None,
 ) -> Response:
-  body = canonical_json_bytes(payload)
   return Response(
-      content=body,
+      content=canonical_json_bytes(payload),
       status_code=status_code,
       media_type=media_type,
       headers=extra_headers or {},
@@ -159,86 +136,11 @@ def a2a_error(status_code: int, code: str, message: str) -> Response:
 
 
 # =====================================================================
-# SQLite Storage Initialization
+# Durable SQLite Persistence Layer
 # =====================================================================
 
 
 def init_db() -> None:
-  with sqlite3.connect(DB_PATH) as conn:
-    conn.execute("PRAGMA journal_mode=WAL;")
-    # Invoice Agent tables
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS a2a_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS invoice_pkg_cache (
-                pkg_fp TEXT PRIMARY KEY,
-                action TEXT NOT NULL,
-                facts_json TEXT NOT NULL,
-                raw_refs_json TEXT NOT NULL,
-                rationale TEXT NOT NULL,
-                verified INTEGER NOT NULL DEFAULT 0,
-                rejected_actions_json TEXT NOT NULL DEFAULT '[]'
-            )
-        """)
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS a2a_tasks (
-                task_id TEXT PRIMARY KEY,
-                principal TEXT NOT NULL,
-                context_id TEXT NOT NULL,
-                batch_id TEXT NOT NULL,
-                state TEXT NOT NULL,
-                task_json TEXT NOT NULL,
-                proposals_map_json TEXT NOT NULL,
-                created_seq INTEGER PRIMARY KEY AUTOINCREMENT
-            )
-        """)
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS a2a_messages (
-                principal TEXT NOT NULL,
-                message_id TEXT NOT NULL,
-                msg_digest TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                response_task_json TEXT NOT NULL,
-                PRIMARY KEY (principal, message_id)
-            )
-        """)
-    # Mailroom tables (for Question 3 compatibility)
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS dossier_cache (
-                content_fp TEXT PRIMARY KEY,
-                action TEXT NOT NULL,
-                target_json TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                evidence_json TEXT NOT NULL
-            )
-        """)
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS evaluations (
-                evaluation_id TEXT PRIMARY KEY,
-                input_digest TEXT NOT NULL,
-                verifier_json TEXT NOT NULL,
-                propose_req_json TEXT NOT NULL,
-                propose_resp_json TEXT NOT NULL,
-                proposals_map_json TEXT NOT NULL,
-                commit_req_json TEXT,
-                commit_resp_json TEXT
-            )
-        """)
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS used_receipts (
-                receipt_id TEXT PRIMARY KEY,
-                evaluation_id TEXT NOT NULL
-            )
-        """)
-    conn.commit()
-
-
-def fix_a2a_tasks_table() -> None:
-  """Ensure a2a_tasks table creation works across SQLite versions."""
   with sqlite3.connect(DB_PATH) as conn:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("""
@@ -280,37 +182,10 @@ def fix_a2a_tasks_table() -> None:
                 PRIMARY KEY (principal, message_id)
             )
         """)
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS dossier_cache (
-                content_fp TEXT PRIMARY KEY,
-                action TEXT NOT NULL,
-                target_json TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                evidence_json TEXT NOT NULL
-            )
-        """)
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS evaluations (
-                evaluation_id TEXT PRIMARY KEY,
-                input_digest TEXT NOT NULL,
-                verifier_json TEXT NOT NULL,
-                propose_req_json TEXT NOT NULL,
-                propose_resp_json TEXT NOT NULL,
-                proposals_map_json TEXT NOT NULL,
-                commit_req_json TEXT,
-                commit_resp_json TEXT
-            )
-        """)
-    conn.execute("""
-            CREATE TABLE IF NOT EXISTS used_receipts (
-                receipt_id TEXT PRIMARY KEY,
-                evaluation_id TEXT NOT NULL
-            )
-        """)
     conn.commit()
 
 
-fix_a2a_tasks_table()
+init_db()
 
 
 def get_bracket_mode() -> str:
@@ -338,13 +213,11 @@ def format_ref(ref_str: str, mode: str) -> str:
     inner = clean[1:-1].strip()
   else:
     inner = clean
-  if mode == "strip":
-    return inner
-  return f"[{inner}]"
+  return inner if mode == "strip" else f"[{inner}]"
 
 
 # =====================================================================
-# A2A 1.0 Protocol Layer (Agent Card, Auth, Headers, Envelopes)
+# Layer 1: Agent Card, Authentication & Header Validation
 # =====================================================================
 
 
@@ -367,30 +240,21 @@ async def get_agent_card(request: Request) -> Response:
   candidate_urls = []
   if configured_base:
     candidate_urls.append(configured_base)
-  for u in (
-      f"{origin}/a2a",
-      f"{origin}/a2a/",
-      f"{origin}",
-      f"{origin}/",
-  ):
+  for u in (f"{origin}/a2a", f"{origin}/a2a/", f"{origin}", f"{origin}/"):
     if u not in candidate_urls:
       candidate_urls.append(u)
 
   supported_interfaces = [
-      {
-          "url": u,
-          "protocolBinding": "HTTP+JSON",
-          "protocolVersion": "1.0",
-      }
+      {"url": u, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}
       for u in candidate_urls
   ]
 
   card = {
       "name": "GA5 Invoice Action Agent",
       "description": (
-          "Autonomous A2A 1.0 invoice adjudication agent that reads invoice"
-          " claim batches, proposes one evidence-backed business action per"
-          " package, and executes approved actions upon receipt continuation."
+          "Public HTTPS A2A 1.0 invoice adjudication agent that reads invoice"
+          " packages, selects one evidence-backed business action per package,"
+          " and executes approved actions upon receipt continuation."
       ),
       "version": "1.0.0",
       "supportedInterfaces": supported_interfaces,
@@ -411,17 +275,11 @@ async def get_agent_card(request: Request) -> Response:
           "id": "invoice_action_agent",
           "name": "Invoice Action Agent",
           "description": (
-              "Evaluates invoice packages against policy limits, reconciles"
-              " PO/receipt records, detects duplicates and conflicts, cites"
-              " decisive references, and gates execution on grader receipts."
+              "Adjudicates invoice claim batches against delegated approval"
+              " limits, reconciliation records, holds, duplicates, and"
+              " exceptions."
           ),
-          "tags": [
-              "invoice",
-              "accounts-payable",
-              "approval",
-              "audit",
-              "a2a",
-          ],
+          "tags": ["invoice", "accounts-payable", "approval", "audit", "a2a"],
           "inputModes": [
               INVOICE_INPUT_BATCH_MIME,
               INVOICE_INPUT_RESULTS_MIME,
@@ -449,7 +307,6 @@ async def get_agent_card(request: Request) -> Response:
 def verify_a2a_headers(
     request: Request, require_content_type: bool = False
 ) -> Tuple[Optional[str], Optional[Response]]:
-  """Validates Bearer authentication, A2A-Version: 1.0, Content-Type, and Accept."""
   auth = request.headers.get("authorization")
   if not auth or not auth.startswith("Bearer "):
     return None, a2a_error(
@@ -491,16 +348,14 @@ def verify_a2a_headers(
           "INVALID_CONTENT_TYPE",
           "Content-Type: application/a2a+json is required",
       )
-    ct_base = ct.split(";")[0].strip().lower()
-    if ct_base != "application/a2a+json":
+    if ct.split(";")[0].strip().lower() != "application/a2a+json":
       return None, a2a_error(
           400,
           "INVALID_CONTENT_TYPE",
           "Content-Type must be application/a2a+json",
       )
   elif ct:
-    ct_base = ct.split(";")[0].strip().lower()
-    if ct_base != "application/a2a+json":
+    if ct.split(";")[0].strip().lower() != "application/a2a+json":
       return None, a2a_error(
           400,
           "INVALID_CONTENT_TYPE",
@@ -511,7 +366,7 @@ def verify_a2a_headers(
 
 
 # =====================================================================
-# Invoice Package Parsing, LLM Decision & Validation Layer
+# Layer 2: Invoice Package Analysis & Batched AI Decision Step
 # =====================================================================
 
 
@@ -544,7 +399,6 @@ def extract_strings_from_obj(obj: Any) -> List[str]:
 def analyze_package_references(
     pkg: Dict[str, Any],
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
-  """Finds all bracketed references in the package and groups them by paragraph."""
   strings = extract_strings_from_obj(pkg)
   all_refs_ordered: List[str] = []
   paragraph_groups: List[Dict[str, Any]] = []
@@ -559,14 +413,15 @@ def analyze_package_references(
       if matches:
         unique_in_para = []
         for m in matches:
-          if m not in unique_in_para:
-            unique_in_para.append(m)
-          if m not in all_refs_ordered:
-            all_refs_ordered.append(m)
+          m_clean = m.strip()
+          if m_clean not in unique_in_para:
+            unique_in_para.append(m_clean)
+          if m_clean not in all_refs_ordered:
+            all_refs_ordered.append(m_clean)
         paragraph_groups.append({
-            "refsInParagraph": [f"[{m}]" for m in unique_in_para],
+            "refsWithBrackets": [f"[{m}]" for m in unique_in_para],
             "count": len(unique_in_para),
-            "snippet": para_str[:450],
+            "paragraphText": para_str[:500],
         })
   return all_refs_ordered, paragraph_groups
 
@@ -577,69 +432,64 @@ def build_valid_rationale(
     formatted_refs: List[str],
     raw_rationale: str,
 ) -> str:
-  """Ensures rationale is 60-1500 chars, names the exact action, and cites all 3 evidenceRefs."""
-  raw_refs_with_brackets = [format_ref(r, "keep") for r in formatted_refs]
-  raw_refs_stripped = [format_ref(r, "strip") for r in formatted_refs]
+  refs_bracketed = [format_ref(r, "keep") for r in formatted_refs]
+  refs_stripped = [format_ref(r, "strip") for r in formatted_refs]
 
   base = (raw_rationale or "").strip()
-  # Verify if base already contains action and at least 2 formatted_refs and bracketed forms
-  needs_prefix = False
-  if action not in base:
-    needs_prefix = True
-  cited_count = sum(1 for r in formatted_refs if r in base)
-  if cited_count < 3:
-    needs_prefix = True
-
-  ref_citation_str = ", ".join(
+  ref_pairs = ", ".join(
       f"{b} ({s})" if b != s else b
-      for b, s in zip(raw_refs_with_brackets, raw_refs_stripped)
+      for b, s in zip(refs_bracketed, refs_stripped)
   )
   prefix = (
       f"Action {action} is selected for vendor {facts['vendorName']} invoice"
       f" {facts['invoiceNumber']} ({facts['currency']} {facts['amountMinor']}"
-      f" minor units) based on decisive evidence {ref_citation_str}. "
+      f" minor units) based on decisive references {ref_pairs}. "
   )
-  if needs_prefix or len(base) < 75:
+
+  if (
+      action not in base
+      or sum(1 for r in formatted_refs if r in base) < 2
+      or len(base) < 75
+  ):
     combined = f"{prefix}{base}".strip()
   else:
     combined = base
 
   if len(combined) < 75:
     combined += (
-        " The cited records establish the authoritative commercial status and"
-        " policy requirement for this package."
+        " These three references establish the operative policy outcome for"
+        " this claim."
     )
   if len(combined) > 1400:
-    # Keep prefix so action + refs are guaranteed to remain in the truncated string
     combined = f"{prefix}{base}"[:1400].strip()
   return combined
 
 
 INVOICE_SYSTEM_PROMPT = """You are an expert Accounts Payable & Audit adjudication engine for an A2A 1.0 Invoice Action Agent.
-For each invoice package, determine the SINGLE correct business action, extract the exact invoice facts, and return the EXACT THREE decisive bracketed references from the paragraph that determines the action.
+For each invoice package in the batch, determine the SINGLE correct business action, extract the exact facts for the live invoice, and return the EXACT THREE decisive bracketed references from the single paragraph that determines the action.
 
 THE 5 PERMITTED ACTIONS:
 1. `settle_invoice`:
-   - The invoice is commercially valid, reconciled against PO/receipt/contract records, not a duplicate of the same invoice, no verification hold is pending, no material record conflict exists, AND the invoice amount is WITHIN the autonomous settlement authority limit defined by the policy.
+   - The live invoice is commercially valid, reconciled against PO/delivery/receipt records, not a duplicate of the same invoice, no verification hold is active, no material record conflict exists, AND the amount is WITHIN the autonomous settlement authority limit.
 2. `request_approval`:
-   - The invoice is commercially valid and reconciled (no material mismatch, no pending hold verification, not a duplicate), BUT the invoice amount exceeds the autonomous settlement authority limit (or policy requires higher/delegated approval before settlement).
+   - The live invoice is commercially valid and reconciled (no material mismatch, no pending hold verification, not a duplicate), BUT the amount exceeds the autonomous authority limit (or policy requires higher/delegated approval).
 3. `hold_invoice`:
-   - Payment must pause until a stated verification, delivery confirmation, inspection, vendor check, or compliance step completes.
+   - Payment must pause until a stated verification, goods inspection, delivery confirmation, or vendor compliance check completes.
 4. `reject_duplicate`:
-   - The EXACT SAME commercial invoice (same invoice / same commercial claim for this vendor) was ALREADY paid/settled.
-   - CRITICAL TRAP: A prior payment for a DIFFERENT invoice number or different order is NOT a duplicate! Do NOT choose `reject_duplicate` if the prior payment was for a different invoice!
+   - The EXACT SAME commercial invoice (same invoice number / same claim) was ALREADY paid/settled.
+   - CRITICAL RULE: A payment for a DIFFERENT invoice number is NOT a duplicate! Never choose `reject_duplicate` if the prior payment was for a different invoice.
 5. `open_exception`:
-   - Material records conflict (e.g., price, quantity, currency, PO, goods receipt, tax/vendor record mismatch, or contradictory authoritative documents) and require an exception workflow.
+   - Material records conflict (e.g., billed amount, quantity, PO terms, goods receipt, tax ID, or currency mismatch between authoritative documents) and require an exception workflow.
 
 CRITICAL EVIDENCE & DECOY RULES:
-- Documents intentionally mix current invoice facts with cover sheets, old archive examples, training decoys, negation ("not an exception", "unlike old case X"), and irrelevant action words.
-- Extract `facts` (`vendorName`, `invoiceNumber`, `amountMinor` as integer in minor units like paise/cents, `currency` as 3-letter code like "INR") ONLY for the CURRENT live invoice being adjudicated—NEVER from an archive example or training decoy!
-- For `evidenceRefs`: Return EXACTLY THE THREE decisive bracketed references from the single decisive paragraph that determines the action for the current invoice.
-- NEVER include the cover-sheet reference, archive example references, or training decoy references!
-- Look at `paragraphGroupsWith3Refs` provided in the helper summary: the decisive paragraph determining the action has 3 bracketed references. Pick those exact 3 references!
-- For `rationale`: Write a clear 100–350 character explanation that explicitly names the chosen action (e.g. `settle_invoice`) and cites all three bracketed references.
+- Each package contains decoys: cover sheets, historical archive examples, training notes, negations ("unlike case X", "not a duplicate"), and irrelevant action words.
+- Extract `facts` (`vendorName`, `invoiceNumber`, `amountMinor` as integer in minor currency units such as paise/cents, `currency` as 3-letter code like `"INR"`) strictly from the CURRENT live invoice being adjudicated—never from an archive example or training note!
+- For `evidenceRefs`: Return EXACTLY THE THREE decisive bracketed references from the single decisive paragraph that determines the action for the live invoice.
+- Do NOT include the cover-sheet reference, archive example references, or training decoy references.
+- Inspect `candidate3RefParagraphs` provided for each package: each entry shows a paragraph containing exactly 3 bracketed references. Pick the exact 3 references from the decisive operational paragraph (ignoring cover sheet, archive, or training paragraphs)!
+- For `rationale`: Write a concise 100–350 character explanation naming the chosen action and citing all three references.
 
-Return JSON with this exact structure:
+Return JSON with this exact shape:
 {
   "decisions": [
     {
@@ -671,10 +521,7 @@ async def call_llm_invoice_batch(
       "Content-Type": "application/json",
   }
   user_content = json.dumps(
-      {
-          "policyRevision": policy_revision,
-          "packages": packages_payload,
-      },
+      {"policyRevision": policy_revision, "packages": packages_payload},
       ensure_ascii=False,
   )
   body = {
@@ -692,7 +539,7 @@ async def call_llm_invoice_batch(
           f"{LLM_BASE_URL}/chat/completions",
           headers=headers,
           json=body,
-          timeout=36.0,
+          timeout=38.0,
       )
       if resp.status_code == 429:
         await asyncio.sleep(2.0 * (attempt + 1))
@@ -724,10 +571,10 @@ def normalize_and_validate_invoice_decision(
     return None
 
   action = raw_dec.get("action")
-  if action not in INVOICE_ALLOWED_ACTIONS:
+  if action not in ALLOWED_ACTIONS:
     return None
   if action in rejected_actions and len(rejected_actions) < len(
-      INVOICE_ALLOWED_ACTIONS
+      ALLOWED_ACTIONS
   ):
     return None
 
@@ -775,11 +622,9 @@ def normalize_and_validate_invoice_decision(
         if stripped in valid_ref_set and stripped not in selected_refs:
           selected_refs.append(stripped)
 
-  # Must have exactly 3 decisive references from the package
   if len(selected_refs) != 3:
-    # Try to find a paragraph group with 3 refs that overlaps best with LLM's chosen refs
     three_ref_groups = [
-        [format_ref(x, "strip") for x in g["refsInParagraph"]]
+        [format_ref(x, "strip") for x in g["refsWithBrackets"]]
         for g in para_groups
         if g["count"] == 3
     ]
@@ -800,12 +645,11 @@ def normalize_and_validate_invoice_decision(
   if not selected_refs:
     return None
 
-  rationale = str(raw_dec.get("rationale") or "").strip()
   return {
       "action": action,
       "facts": clean_facts,
       "raw_refs": selected_refs,
-      "rationale": rationale,
+      "rationale": str(raw_dec.get("rationale") or "").strip(),
   }
 
 
@@ -814,7 +658,7 @@ def fallback_invoice_decision(
 ) -> Dict[str, Any]:
   all_pkg_refs, para_groups = analyze_package_references(pkg)
   three_ref_groups = [
-      [format_ref(x, "strip") for x in g["refsInParagraph"]]
+      [format_ref(x, "strip") for x in g["refsWithBrackets"]]
       for g in para_groups
       if g["count"] == 3
   ]
@@ -826,8 +670,8 @@ def fallback_invoice_decision(
     refs = (all_pkg_refs + ["REF-1", "REF-2", "REF-3"])[:3]
 
   candidates = [
-      a for a in INVOICE_ALLOWED_ACTIONS if a not in rejected_actions
-  ] or INVOICE_ALLOWED_ACTIONS
+      a for a in ALLOWED_ACTIONS if a not in rejected_actions
+  ] or ALLOWED_ACTIONS
   action = candidates[0]
   facts = {
       "vendorName": str(pkg.get("vendorName") or "Vendor"),
@@ -911,7 +755,6 @@ async def evaluate_invoice_batch(
     if cached is not None:
       rejected_list = cached.get("rejected_actions", [])
       rejected_by_fp[fp] = rejected_list
-      # Use cached decision if verified OR if its action hasn't been rejected
       if cached["verified"] or cached["action"] not in rejected_list:
         dec_by_pkg_id[pid] = cached
       else:
@@ -938,13 +781,12 @@ async def evaluate_invoice_batch(
             _, para_groups = analyze_package_references(p)
             item = {
                 "package": p,
-                "paragraphGroupsWith3Refs": [
+                "candidate3RefParagraphs": [
                     g for g in para_groups if g["count"] == 3
                 ],
-                "allParagraphRefGroups": para_groups,
             }
             if rejected_by_fp.get(fp):
-              item["CRITICAL_PREVIOUSLY_REJECTED_ACTIONS_DO_NOT_CHOOSE"] = (
+              item["PREVIOUSLY_REJECTED_ACTIONS_DO_NOT_REPEAT"] = (
                   rejected_by_fp[fp]
               )
             enriched_chunk.append(item)
@@ -993,7 +835,7 @@ async def evaluate_invoice_batch(
 
 
 # =====================================================================
-# A2A Route Handlers (/message:send, /tasks, /tasks/{id}, /tasks/{id}:cancel)
+# Layer 3 & 4: A2A Route Handlers & Receipt Gate
 # =====================================================================
 
 
@@ -1101,7 +943,6 @@ async def handle_a2a_message_send(request: Request) -> Response:
         400, "UNSUPPORTED_MEDIA_TYPE", "Unsupported part mediaType"
     )
 
-  # Validate configuration if present
   config = req.get("configuration")
   if config is not None:
     if not isinstance(config, dict):
@@ -1120,7 +961,7 @@ async def handle_a2a_message_send(request: Request) -> Response:
             "Required output modes not accepted",
         )
 
-  # Compute canonical digest of `message` ONLY (ignore `configuration` per spec)
+  # Deduplicate by (principal, messageId) over canonical JSON of `message` only
   msg_digest = sha256_hex(canonical_json_bytes(msg))
   msg_lock = get_msg_lock(principal, message_id)
 
@@ -1136,7 +977,7 @@ async def handle_a2a_message_send(request: Request) -> Response:
       ).fetchone()
 
       if existing_msg is not None:
-        stored_digest, stored_task_id, stored_resp_task_json = existing_msg
+        stored_digest, _, stored_resp_task_json = existing_msg
         if stored_digest != msg_digest:
           return a2a_error(
               409,
@@ -1145,13 +986,11 @@ async def handle_a2a_message_send(request: Request) -> Response:
           )
         return a2a_response({"task": json.loads(stored_resp_task_json)})
 
-    # New (principal, messageId): dispatch to initial batch or results continuation
     if media_type == INVOICE_INPUT_BATCH_MIME:
       ok, err_msg, batch_data = validate_initial_batch_part(part)
       if not ok or batch_data is None:
         return a2a_error(400, "INVALID_BATCH_PAYLOAD", err_msg)
 
-      # If taskId is provided on an initial batch message, verify it doesn't collide with an existing task
       supplied_task_id = msg.get("taskId")
       if supplied_task_id is not None:
         if (
@@ -1180,7 +1019,6 @@ async def handle_a2a_message_send(request: Request) -> Response:
 
       proposals = await evaluate_invoice_batch(packages, policy_rev)
 
-      # Map packageId -> proposal andpkg_fp for continuation verification
       proposals_map: Dict[str, Dict[str, Any]] = {}
       for pkg, prop in zip(packages, proposals):
         proposals_map[prop["packageId"]] = {
@@ -1242,7 +1080,7 @@ async def handle_a2a_message_send(request: Request) -> Response:
       return a2a_response({"task": task_obj})
 
     else:
-      # media_type == INVOICE_INPUT_RESULTS_MIME (Continuation)
+      # Results Continuation
       task_id = msg.get("taskId")
       context_id = msg.get("contextId")
       if not isinstance(task_id, str) or not task_id.strip():
@@ -1273,7 +1111,7 @@ async def handle_a2a_message_send(request: Request) -> Response:
             return a2a_error(404, "TASK_NOT_FOUND", "Resource not found")
 
           (
-              stored_principal,
+              _,
               stored_ctx_id,
               stored_batch_id,
               stored_state,
@@ -1287,13 +1125,10 @@ async def handle_a2a_message_send(request: Request) -> Response:
                 "CONTEXT_MISMATCH",
                 "contextId does not match stored Task",
             )
-
           if results_data["batchId"] != stored_batch_id:
             return a2a_error(
                 400, "BATCH_MISMATCH", "batchId does not match stored Task"
             )
-
-          # Terminal check (Cancel-vs-Result race or already completed task)
           if stored_state != "TASK_STATE_INPUT_REQUIRED":
             return a2a_error(
                 409,
@@ -1348,7 +1183,6 @@ async def handle_a2a_message_send(request: Request) -> Response:
               )
             results_by_pkg[pid] = r
 
-          # Build executions array in proposal order for ACCEPTED outcomes only
           stored_task = json.loads(stored_task_json)
           executions = []
           accepted_count = 0
@@ -1367,27 +1201,44 @@ async def handle_a2a_message_send(request: Request) -> Response:
                   "facts": prop["facts"],
                   "evidenceRefs": prop["evidenceRefs"],
               })
-              # Lock verified proposal in SQLite cache
               conn.execute(
                   "UPDATE invoice_pkg_cache SET verified = 1 WHERE pkg_fp = ?",
                   (pkg_fp,),
               )
-            else:
-              # Record rejected action so future runs don't repeat a rejected choice
-              c_row = conn.execute(
-                  "SELECT verified, rejected_actions_json FROM"
-                  " invoice_pkg_cache WHERE pkg_fp = ?",
-                  (pkg_fp,),
-              ).fetchone()
-              if c_row and not c_row[0]:
-                rej_list = json.loads(c_row[1])
-                if prop["action"] not in rej_list:
-                  rej_list.append(prop["action"])
-                conn.execute(
-                    "UPDATE invoice_pkg_cache SET rejected_actions_json = ?"
-                    " WHERE pkg_fp = ?",
-                    (canonical_json_str(rej_list), pkg_fp),
-                )
+
+          # If a whole 12-package batch got 0 ACCEPTED, auto-toggle bracket mode for subsequent batches
+          if len(proposals_map) >= 6 and accepted_count == 0:
+            cur_mode_row = conn.execute(
+                "SELECT value FROM a2a_settings WHERE key = 'bracket_mode'"
+            ).fetchone()
+            cur_mode = cur_mode_row[0] if cur_mode_row else "keep"
+            new_mode = "strip" if cur_mode == "keep" else "keep"
+            conn.execute(
+                "INSERT OR REPLACE INTO a2a_settings (key, value) VALUES"
+                " ('bracket_mode', ?)",
+                (new_mode,),
+            )
+          elif accepted_count > 0:
+            # Record rejected actions on individual missed packages
+            for pid, entry in proposals_map.items():
+              prop = entry["proposal"]
+              pkg_fp = entry["pkg_fp"]
+              res = results_by_pkg[pid]
+              if res["outcome"] == "REJECTED":
+                c_row = conn.execute(
+                    "SELECT verified, rejected_actions_json FROM"
+                    " invoice_pkg_cache WHERE pkg_fp = ?",
+                    (pkg_fp,),
+                ).fetchone()
+                if c_row and not c_row[0]:
+                  rej_list = json.loads(c_row[1])
+                  if prop["action"] not in rej_list:
+                    rej_list.append(prop["action"])
+                  conn.execute(
+                      "UPDATE invoice_pkg_cache SET rejected_actions_json = ?"
+                      " WHERE pkg_fp = ?",
+                      (canonical_json_str(rej_list), pkg_fp),
+                  )
 
           receipt_artifact = {
               "artifactId": f"art_receipts_{task_id}",
@@ -1423,13 +1274,7 @@ async def handle_a2a_message_send(request: Request) -> Response:
                         (principal, message_id, msg_digest, task_id, response_task_json)
                         VALUES (?, ?, ?, ?, ?)
                         """,
-              (
-                  principal,
-                  message_id,
-                  msg_digest,
-                  task_id,
-                  completed_canon,
-              ),
+              (principal, message_id, msg_digest, task_id, completed_canon),
           )
           conn.commit()
 
@@ -1534,7 +1379,6 @@ async def handle_a2a_cancel_task(task_id: str, request: Request) -> Response:
 
       _, stored_state, stored_task_json = row
 
-      # Only a nonterminal task may be canceled; terminal tasks return 409
       if stored_state != "TASK_STATE_INPUT_REQUIRED":
         return a2a_error(
             409,
@@ -1547,7 +1391,6 @@ async def handle_a2a_cancel_task(task_id: str, request: Request) -> Response:
           "state": "TASK_STATE_CANCELED",
           "timestamp": now_iso(),
       }
-      # Ensure only the proposal artifact is present (no final receipt on canceled task)
       task_obj["artifacts"] = [task_obj["artifacts"][0]]
       canceled_canon = canonical_json_str(task_obj)
 
@@ -1560,7 +1403,7 @@ async def handle_a2a_cancel_task(task_id: str, request: Request) -> Response:
   return a2a_response(task_obj)
 
 
-# Register A2A Routes under both /a2a/... and root /...
+# Register routes under both /a2a/... and /...
 @app.post("/a2a/message:send")
 @app.post("/message:send")
 async def route_message_send(request: Request) -> Response:
@@ -1590,58 +1433,10 @@ async def route_task_post_actions(task_path: str, request: Request) -> Response:
   return a2a_error(404, "NOT_FOUND", "Unknown task action")
 
 
-# =====================================================================
-# Question 3 Mailroom Agent (Kept active at /mailroom)
-# =====================================================================
-
-
-def decode_b64url(val: str) -> bytes:
-  if not isinstance(val, str) or not val.strip():
-    raise ValueError("Invalid base64url string")
-  s = val.strip()
-  pad = "=" * ((4 - len(s) % 4) % 4)
-  return base64.urlsafe_b64decode(s + pad)
-
-
-def decode_b64_signature(val: str) -> bytes:
-  if not isinstance(val, str) or not val.strip():
-    raise ValueError("Empty signature")
-  s = val.strip()
-  pad = "=" * ((4 - len(s) % 4) % 4)
-  raw = (
-      base64.urlsafe_b64decode(s + pad)
-      if ("-" in s or "_" in s)
-      else base64.b64decode(s + pad, validate=True)
-  )
-  if len(raw) != 64:
-    raise ValueError("Ed25519 signature must be 64 bytes")
-  return raw
-
-
-def parse_ed25519_jwk(verifier: Any) -> Ed25519PublicKey:
-  if not isinstance(verifier, dict) or verifier.get("algorithm") != "Ed25519":
-    raise ValueError("Invalid verifier")
-  jwk = verifier.get("publicKeyJwk")
-  if (
-      not isinstance(jwk, dict)
-      or jwk.get("kty") != "OKP"
-      or jwk.get("crv") != "Ed25519"
-  ):
-    raise ValueError("Invalid JWK")
-  pub_bytes = decode_b64url(jwk.get("x"))
-  if len(pub_bytes) != 32:
-    raise ValueError("Invalid key length")
-  return Ed25519PublicKey.from_public_bytes(pub_bytes)
-
-
 @app.get("/")
 @app.get("/a2a")
 @app.get("/a2a/")
 async def health_check() -> Response:
-  return json_response({
-      "status": "ok",
-      "service": "ga5-multi-agent",
-      "a2a": "/a2a",
-      "mailroom": "/mailroom",
-      "version": "v4",
-  })
+  return json_response(
+      {"status": "ok", "service": "ga5-invoice-a2a-agent", "version": "1.0.0"}
+  )
